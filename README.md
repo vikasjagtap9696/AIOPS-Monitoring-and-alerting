@@ -3,6 +3,7 @@
 **Prometheus + Alertmanager + Flask AIOps + Gemini + RAG (ChromaDB) + Auto-Remediation + Slack**
  
 ![AIOps Architecture](architecture.png)
+
  
 ## Table of Contents
  
