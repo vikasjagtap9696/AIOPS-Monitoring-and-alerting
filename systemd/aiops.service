@@ -1,0 +1,17 @@
+[Unit]
+Description=AIOps Incident Analysis Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aiops
+Group=aiops
+WorkingDirectory=/opt/aiops
+EnvironmentFile=/opt/aiops/.env
+ExecStart=/opt/aiops/venv/bin/gunicorn --workers 2 --bind 127.0.0.1:5000 aiops.app:app
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
