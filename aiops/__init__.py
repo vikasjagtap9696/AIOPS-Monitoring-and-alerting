@@ -1,2 +1,0 @@
-"""AIOps incident analysis service."""
-
