@@ -1,7 +1,82 @@
 # 🤖 AI-Powered AIOps Incident Management Platform
 
+Build an AWS EC2 monitoring and incident-response lab with Prometheus, Grafana, Alertmanager, a Flask AIOps service, Google Gemini, SSH evidence collection, ChromaDB runbooks, and Slack notifications.
 
-> **Lab guide:** Complete phased deployment. Each new `app.py` replaces the previous phase. Use a Python 3 virtual environment, replace example IPs consistently, and never commit `.env` or private keys. Earlier remediation examples are historical lab code; keep `AUTO_REMEDIATE=false` until you have reviewed and authorized actions. Cache dropping, log deletion and arbitrary service restarts are not recommended automatic actions.
+![AIOps Architecture](architecture.png)
+
+> **Use this guide in order.** Each phase replaces `/opt/aiops/app.py` with that phase's version, so always use the latest `app.py` example for the phase you are completing. Run commands on the host named in the step. Replace every ALL-CAPS placeholder (for example, `TEST_1_PRIVATE_IP`) with your own value before pasting. Keep `AUTO_REMEDIATE=false` unless you have reviewed and explicitly approved each action. This is a lab guide, not a production-ready deployment.
+
+## Deployment path
+
+| Step | Guide section | Result |
+| --- | --- | --- |
+| 0 | [Before you begin](#before-you-begin) | AWS instances, access, Slack webhook, and required values are ready |
+| 1 | [Monitoring and alerting](#phase-1--monitoring--alerting-stack) | Prometheus, Grafana, Alertmanager, Node Exporter, and Slack |
+| 2 | [Gemini RCA](#phase-2--ai-service-flask--gemini-rca-with-prometheus-metrics) | Flask service analyzes alerts and Prometheus metrics |
+| 3 | [SSH investigation](#phase-3--advanced-rca-ssh-based-investigation) | AIOps gathers evidence from monitored EC2 instances |
+| 4 | [Auto-remediation](#phase-4--auto-remediation) | Optional, explicitly controlled recovery actions |
+| 5 | [Nginx and RAG](#phase-5--nginx-example-rag-runbook-chromadb) | Nginx alerts and ChromaDB runbook retrieval |
+| Help | [Troubleshooting](#troubleshooting--errors) | Service checks and common fixes |
+| Reference | [SRE concepts](#appendix--sre-concepts) | SRE terminology |
+
+## Before you begin
+
+### What you need
+
+- An AWS account with permission to launch EC2 instances, configure security groups, and create/attach an IAM role.
+- One Amazon Linux 2023 **monitoring server** and two Amazon Linux 2023 **test servers**. The examples use `c7i-flex.large` with a 30 GB disk for monitoring and `t3.micro` for each test server; select sizes appropriate for your lab.
+- An EC2 instance profile on the monitoring server with `ec2:DescribeInstances` permission. Add `ec2:DescribeAvailabilityZones` only if required by your discovery setup.
+- A Slack workspace and Incoming Webhook URL. Create an app at [api.slack.com/apps](https://api.slack.com/apps/), enable Incoming Webhooks, add a webhook to your channel, and keep the URL private.
+- A Google Gemini API key for Phases 2–5. Create one at [aistudio.google.com/apikey](https://aistudio.google.com/apikey).
+- An SSH key pair and the ability to connect from the monitoring server to each test server using its private IP.
+
+### Security group checklist
+
+Use the monitoring server's security group as the source for internal monitoring and SSH traffic. Restrict browser-facing ports to **your own IP**; do not expose these lab services to `0.0.0.0/0`.
+
+| Destination | Port | Allow from |
+| --- | ---: | --- |
+| Test servers: SSH | 22 | Monitoring server security group (and your IP only when needed) |
+| Test servers: Node Exporter | 9100 | Monitoring server security group |
+| Nginx test server: exporter | 9113 | Monitoring server security group |
+| Monitoring server: Prometheus UI | 9090 | Your IP |
+| Monitoring server: Alertmanager UI | 9093 | Your IP |
+| Monitoring server: Grafana UI | 3000 | Your IP |
+
+The AIOps Flask service listens on `127.0.0.1:5000` in the examples, so Alertmanager can call it on the monitoring host. Do not open port 5000 to the public internet.
+
+### Prepare your values
+
+Keep a note of these values. Use private IPs for communication between EC2 instances and the monitoring server's public IP only when opening the web dashboards in your browser.
+
+| Placeholder | Replace with |
+| --- | --- |
+| `MONITORING_PUBLIC_IP` | Public IPv4 address of the monitoring server |
+| `TEST_1_PRIVATE_IP` / `TEST_2_PRIVATE_IP` | Private IPv4 addresses of the test servers |
+| `SLACK_WEBHOOK_URL` | Slack Incoming Webhook URL |
+| `GEMINI_API_KEY` | Google Gemini API key |
+| `AWS_REGION` | AWS region containing the EC2 instances |
+
+### Copy/paste conventions
+
+1. Copy one complete command block at a time into the correct server's SSH terminal.
+2. Blocks marked **Monitoring server** run on the monitoring EC2 instance; blocks marked **Test server** run on the named target.
+3. For file examples, open the named file, replace the relevant content with the complete fenced code block, save it, and then run the validation/restart commands that follow.
+4. Do not paste prompt text, explanatory lines, or Markdown fences into a shell.
+5. Keep API keys, webhook URLs, and private SSH keys out of Git and chat logs. Do not commit `.env`, `.pem`, or private key files.
+
+## Overview
+
+The project receives infrastructure alerts, enriches them with metrics and (in later phases) SSH evidence and runbook context, then posts an analysis to Slack.
+
+### Files in this repository
+
+| File | Purpose |
+| --- | --- |
+| `architecture.png` | AIOps architecture diagram |
+| `node-exporter.sh.txt` | Node Exporter installation commands for each test server |
+| `Implementation.txt` | Additional project implementation notes |
+| `README.md` | Phased deployment instructions and the monitoring-server installation script |
 
 ```mermaid
 flowchart TD
@@ -12,140 +87,98 @@ flowchart TD
  D --> F[ChromaDB RAG]
  E --> G[Gemini RCA]
  F --> G
- G --> H[Validated recovery]
+ G --> H[Optional reviewed remediation]
  H --> I[Slack report]
 ```
 
-**Prometheus + Alertmanager + Flask AIOps + Gemini + RAG (ChromaDB) + Auto-Remediation + Slack**
+### Technology stack
 
-![AIOps Architecture](architecture.png)
-
-## Phases
-
-| Phase | What gets built |
-| ----- | --------------- |
-| [Overview](#overview) | Project summary, technologies, flow |
-| [Phase 1](#phase-1--monitoring--alerting-stack) | Prometheus, Grafana, Alertmanager, Node Exporter, Slack alerts |
-| [Phase 2](#phase-2--ai-service-flask--gemini-rca-with-prometheus-metrics) | Flask AIOps service, Gemini RCA using Prometheus metrics |
-| [Phase 3](#phase-3--advanced-rca-ssh-based-investigation) | SSH evidence collection from EC2 + Gemini RCA |
-| [Phase 4](#phase-4--auto-remediation) | Safe auto-remediation (restart, cache, logs/tmp cleanup) |
-| [Phase 5](#phase-5--nginx-example-rag-runbook-chromadb) | Nginx exporter, NginxDown alert, RAG runbook with ChromaDB |
-| [Troubleshooting](#troubleshooting--errors) | Common problems and fixes |
-| [Appendix](#appendix--sre-concepts) | SRE concepts |
-
-## Repository Files
-
-| File | Description |
-| ---- | ----------- |
-| `architecture.png` | AI-Powered AIOps Incident Management Architecture diagram |
-| `allinoneinstallation.sh` | Installs Prometheus, Alertmanager, Node Exporter and Grafana on the monitoring server |
-| `node-exporter.sh` | Installs Node Exporter on the target (test) servers |
-| `AIOps_Gemini_Complete_Notes.txt` | Complete step-by-step project notes |
-
----
-
-## Overview
-
-This project demonstrates an AI-powered incident management and self-healing infrastructure platform on AWS EC2. It combines infrastructure monitoring, Gemini-based root cause analysis, SSH evidence collection, retrieval-augmented generation (RAG), controlled remediation, and Slack incident reporting.
-
-### Key Features
-
-- **Infrastructure monitoring:** Prometheus EC2 service discovery, Node Exporter and Nginx Exporter.
-- **Observability:** Grafana dashboards and PromQL alert rules for CPU, memory, disk and service health.
-- **Incident management:** Alertmanager webhooks and a Flask-based AIOps engine.
-- **Intelligent RCA:** Google Gemini analyzes metrics and SSH evidence.
-- **RAG:** ChromaDB retrieves relevant operational runbooks using Gemini embeddings.
-- **Self-healing:** Configurable remediation workflows and recovery verification for supported incidents.
-- **Notifications:** Slack incident reports and remediation results.
-
-### Technology Stack
-
-| Layer              | Technology           |
-| ------------------ | -------------------- |
-| Monitoring         | Prometheus           |
-| Visualization      | Grafana              |
-| Alerting           | Alertmanager         |
-| AIOps API          | Flask                |
-| AI Engine          | Google Gemini        |
-| Investigation      | SSH + Linux Commands |
-| Auto-Healing       | systemctl, kubectl   |
-| Notification       | Slack                |
-| Infrastructure     | AWS EC2 / Kubernetes |
-| Enhancement        | RAG + Vector DB      |
-
-```text
-Linux Servers
-      ↓
-Node Exporter + Nginx Exporter
-      ↓
-Prometheus
-      ↓
-Alertmanager
-      ↓
-Flask AIOps Engine
-      ↓
-SSH Evidence Collection
-      ↓
-RAG + ChromaDB Runbooks
-      ↓
-Gemini Root Cause Analysis
-      ↓
-Auto Remediation
-      ↓
-Verification
-      ↓
-Slack Incident Report
-```
-
----
+| Layer | Technology |
+| --- | --- |
+| Monitoring and dashboards | Prometheus, Grafana |
+| Alert routing | Alertmanager |
+| AIOps API | Flask |
+| AI analysis | Google Gemini |
+| Evidence collection | SSH, Paramiko, Linux tools |
+| Runbook retrieval | ChromaDB, Gemini embeddings |
+| Notifications | Slack |
+| Infrastructure | AWS EC2 |
 
 ## Phase 1 — Monitoring & Alerting Stack
 
-### Step-by-step notes
+### Step 1: Launch and tag the EC2 instances
 
-Launch Amazon Linux 2023[Monitoring Server], with c7i-flex.large, 30GB and attach an IAM role allowing EC2 DescribeInstances (and DescribeAvailabilityZones if needed)
+1. Launch one Amazon Linux 2023 instance for the **monitoring server**.
+2. Launch two Amazon Linux 2023 instances for **Test-1** and **Test-2**.
+3. Set the EC2 **Name** tags to `Test-1` and `Test-2` respectively. The AIOps inventory in Phase 3 uses these exact names.
+4. Add this EC2 tag to both test instances:
 
-Launch 2 Amazon Linux 2023 EC2 instances[test1 and test2] t3.micro with the tag monitor = node_server
+   | Key | Value |
+   | --- | --- |
+   | `monitor` | `node_server` |
 
-SignUp to Slack https://app.slack.com/--> create a new channel
-Create a webhook URL --> https://api.slack.com/apps/
-create a new app --> Starter app -->  Blank App--> App name: , workspace:
-left side --> incoming webhooks --> Active incoming webhook ON --> copy the webhook URL
+5. Attach the EC2 discovery role described in [What you need](#what-you-need) to the monitoring server.
+6. Configure the security groups using the [Security group checklist](#security-group-checklist).
+7. Note each instance's private IP address and the monitoring server's public IP.
 
-### In monitoring server
+### Step 2: Create a Slack Incoming Webhook
+
+Create a Slack app, enable **Incoming Webhooks**, add a webhook for the channel where you want alerts, and copy the webhook URL. Keep it private; you will enter it on the monitoring server in the next step.
+
+### Step 3: Install the monitoring stack
+
+**On the monitoring server:** first edit `REGION` in the [`allinoneinstallation.sh` script](#script-allinoneinstallationsh-monitoring-server) to match your `AWS_REGION`. Save the complete script shown below as `/tmp/allinoneinstallation.sh`. For example, open an editor with `sudo vi /tmp/allinoneinstallation.sh`, paste the entire script block, save and exit (`Esc`, `:wq`, `Enter`), then run:
 
 ```bash
-export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
+read -rsp "Slack Incoming Webhook URL: " SLACK_WEBHOOK_URL; echo
+export SLACK_WEBHOOK_URL
+sudo --preserve-env=SLACK_WEBHOOK_URL bash /tmp/allinoneinstallation.sh
+unset SLACK_WEBHOOK_URL
 ```
 
-Run the Script on Monitoring Server which will install everything (Prometheus, Grafana, Alert manager, Node Exporter)
-This script will do all the magic, it installs, configures, create rules, alert manager and send to slack
+The script installs and configures Prometheus, Alertmanager, Grafana, and a local Node Exporter. It also creates low-threshold CPU, memory, and disk demo alerts. Review the script before running it; it updates packages and writes system configuration.
 
-### Login to Test1 and Test2 and install node exporter using script [Node Selector will help to collect metrics and send to Prometheus]
+### Step 4: Install Node Exporter on both test servers
+
+**On each test server:** copy and run the complete [`node-exporter.sh` script](#script-node-exportersh-test-servers) shown below. Confirm the service is active:
 
 ```bash
-vi node.sh
+sudo systemctl status node_exporter --no-pager
 ```
 
-run the node_exporters on test machines
+Repeat on Test-1 and Test-2. The monitoring server discovers them through the `monitor=node_server` tag.
 
-http://35.154.86.111:9090/  Prometheus  --> status --> targets [see all 2 EC2 instances are discovered and up]
+### Step 5: Verify targets and dashboards
 
-In Prometheus --> click on alerts --> it shows yellow --> pending , after sometime it will be firing
+1. Open `http://MONITORING_PUBLIC_IP:9090/targets`. Confirm both test Node Exporter targets are **UP**.
+2. Open `http://MONITORING_PUBLIC_IP:9090/alerts`. Demo alerts may show **Pending** and then **Firing** because the example thresholds are intentionally low.
+3. Open `http://MONITORING_PUBLIC_IP:9093` to check Alertmanager.
+4. Open `http://MONITORING_PUBLIC_IP:3000` to sign in to Grafana. The install example uses `admin` / `admin`; change the password at first login.
+5. In Grafana, add a Prometheus data source with URL `http://localhost:9090`, then save and test it.
+6. Confirm a test notification arrives in your Slack channel.
 
-http://35.154.86.111:9093/   Alert manager  [no alerts yet, wait for sometime]
+### Step 6: Validate configuration changes
 
-http://35.154.86.111:3000 Grafana
+After editing Prometheus rules or configuration, validate them before restarting the service:
 
-Go to Grafana --> Connections --> Add the DataSource --> Prometheus --> http://localhost:9090
+```bash
+sudo promtool check config /etc/prometheus/prometheus.yml
+sudo promtool check rules /etc/prometheus/alert.rules.yml
+sudo systemctl restart prometheus
+sudo systemctl status prometheus --no-pager
+```
 
-Alerting --> Alert rules --> manage alert rules --> you can see the alerts
+After editing Alertmanager configuration:
 
-See the alerts in slack
+```bash
+sudo amtool check-config /etc/alertmanager/alertmanager.yml
+sudo systemctl restart alertmanager
+sudo systemctl status alertmanager --no-pager
+```
 
-*********** ADDITIONAL **********************
+---
 
-### Troubleshoot
+### Phase 1 troubleshooting
 
 ```bash
 aws ec2 describe-instances --region ap-south-1 | grep node_server
@@ -168,7 +201,7 @@ systemctl restart prometheus
 Alertmanager config  -> /etc/alertmanager/alertmanager.yml
 Prometheus rules     -> /etc/prometheus/alert.rules.yml
 
-### if Grafana not installed due to some error
+#### Repair the Grafana repository
 
 ```bash
 grep -R "grafana" /etc/yum.repos.d/
@@ -601,7 +634,7 @@ sudo systemctl start node_exporter.service && sudo systemctl status node_exporte
 
 ## Phase 2 — AI Service (Flask + Gemini RCA with Prometheus metrics)
 
-### Lets add AI to this Project [on Monitoring Server]
+### Install the AIOps application on the monitoring server
 
 ```bash
 mkdir -p /opt/aiops
@@ -1142,7 +1175,7 @@ see in the slack now
 
 ## Phase 3 — Advanced RCA (SSH-Based Investigation)
 
-### Phase 3: Advanced RCA (SSH-Based Investigation)
+### Incident data flow
 
 Instead of:
 
@@ -1190,190 +1223,140 @@ AIOps Python Service
     |
 Slack
 
-### Create AIOps Project
+### Configure SSH evidence collection
 
-### On MonitoringServer
-
-```bash
-python3 -m pip install flask requests google-genai paramiko
-```
+### Install the SSH dependency on the monitoring server
 
 ```bash
-python3 -m pip list | grep paramiko
+source /opt/aiops/venv/bin/activate
+python3 -m pip install paramiko
+python3 -m pip show paramiko
 ```
 
-Flask     → Receives alerts
-Requests  → Slack/Gemini API
-Paramiko  → SSH to EC2
-Gemini    → RCA Analysis
+Generate the key as `root` because the example systemd service runs as root and the SSH helper reads `/root/.ssh/id_rsa`. If this key already exists, do not overwrite it; reuse it or choose a different key path and update `KEY` in `ssh_client.py`.
 
 ```bash
-ssh-keygen -t rsa -b 4096
+sudo install -d -m 700 /root/.ssh
+sudo ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -N ""
+sudo chmod 600 /root/.ssh/id_rsa
+sudo cat /root/.ssh/id_rsa.pub
 ```
 
-```bash
-vi Mykey.pem
-```
+Copy the **public** key line printed by the command. Never copy or share `/root/.ssh/id_rsa` (the private key).
 
-paste the pem file data
-
-```bash
-chmod 400 MyKey.pem
-```
-
-```bash
-cat ~/.ssh/id_rsa.pub
-```
-
-Use the public key printed by the preceding command.
-
-copy the content
-
------------------------------------
-
-```bash
-ssh -i MyKey.pem ec2-user@172.31.23.115  [dont copy paste[you get permission denied], write the command]
-```
-
-Be in ec2-user, dont do sudo
-
-On Target EC2
+On **each target EC2**, sign in as `ec2-user` (do not use `sudo` for these home-directory commands) and append the copied public key. Replace the placeholder with the complete public key line:
 
 ```bash
 mkdir -p ~/.ssh
-```
-
-```bash
 chmod 700 ~/.ssh
-```
-
-```bash
-vi ~/.ssh/authorized_keys
-```
-
-Append the contents of /root/.ssh/id_rsa.pub; preserve existing authorized keys.
-
-```bash
+touch ~/.ssh/authorized_keys
+echo 'PASTE_MONITORING_SERVER_PUBLIC_KEY_HERE' >> ~/.ssh/authorized_keys
 chmod 600 ~/.ssh/authorized_keys
 ```
 
+Preserve any existing lines in `authorized_keys`. Repeat on Test-1 and Test-2.
+
+From the monitoring server, verify access to both private IP addresses:
+
 ```bash
-exit
+sudo ssh -i /root/.ssh/id_rsa ec2-user@TEST_1_PRIVATE_IP
+sudo ssh -i /root/.ssh/id_rsa ec2-user@TEST_2_PRIVATE_IP
 ```
 
-```bash
-ssh -i ~/.ssh/id_rsa ec2-user@172.31.18.152
-```
+On the first connection, verify the host fingerprint before accepting it. Exit each SSH session before testing the next host. Confirm port 22 allows traffic from the monitoring server's security group.
 
---------------------------------
-
-Do the same for another Test-2 instance 172.31.26.3
-
-### On Monitoring server
-
-Create Server Inventory
+### Create the server inventory on the monitoring server
 
 ```bash
-vi /opt/aiops/servers.json
+sudo vi /opt/aiops/servers.json
 ```
 
 ```json
 {
   "Test-1": {
-    "host": "172.31.18.152",
+    "host": "TEST_1_PRIVATE_IP",
     "user": "ec2-user"
   },
 
   "Test-2": {
-    "host": "172.31.28.31",
+    "host": "TEST_2_PRIVATE_IP",
     "user": "ec2-user"
   }
 }
 ```
 
-### Create SSH Module so that AI will login to Test servers and get details using paramiko
-
-On monitoring server
+### Create the SSH helper on the monitoring server
 
 ```bash
-vi /opt/aiops/ssh_client.py
+sudo vi /opt/aiops/ssh_client.py
 ```
 
+```python
 import paramiko
 
-KEY="/root/.ssh/id_rsa"
+KEY = "/root/.ssh/id_rsa"
 
-def run_command(host,user,command):
 
+def run_command(host, user, command):
     ssh = paramiko.SSHClient()
-
-    ssh.set_missing_host_key_policy(
-        paramiko.AutoAddPolicy()
-    )
-
-    ssh.connect(
-        hostname=host,
-        username=user,
-        key_filename=KEY
-    )
-
-    stdin, stdout, stderr = ssh.exec_command(command)
-
-    output = stdout.read().decode()
-
-    ssh.close()
-
-    return output
-
-### Test SSH Collection
-
-```bash
-cd /opt/aiops
+    ssh.load_system_host_keys()
+    try:
+        ssh.connect(hostname=host, username=user, key_filename=KEY, timeout=10)
+        _, stdout, stderr = ssh.exec_command(command, timeout=15)
+        output = stdout.read().decode()
+        error = stderr.read().decode()
+        if error:
+            output = f"{output}\n{error}".strip()
+        return output
+    finally:
+        ssh.close()
 ```
 
+### Test SSH collection
+
 ```bash
-vi test.py
+sudo vi /opt/aiops/test.py
 ```
 
 ```python
 from ssh_client import run_command
 
-print(
- run_command(
-   "172.31.18.152",
-   "ec2-user",
-   "uptime"
- )
-)
+print(run_command("TEST_1_PRIVATE_IP", "ec2-user", "uptime"))
 ```
 
 ```bash
-/opt/aiops/venv/bin/python3 test.py
+/opt/aiops/venv/bin/python3 /opt/aiops/test.py
 ```
 
-### Collect Live Server Data
+### Collect sample server data
 
 ```bash
-vi collect.py
+sudo vi /opt/aiops/collect.py
 ```
 
 ```python
 from ssh_client import run_command
 
-host="172.31.20.42"
+host = "TEST_1_PRIVATE_IP"
 
-print(run_command(host,"ec2-user","top -bn1 | head -15"))
-print(run_command(host,"ec2-user","free -m"))
-print(run_command(host,"ec2-user","df -h"))
-print(run_command(host,"ec2-user","uptime"))
-print(run_command(host,"ec2-user","systemctl --failed"))
+print(run_command(host, "ec2-user", "top -bn1 | head -15"))
+print(run_command(host, "ec2-user", "free -m"))
+print(run_command(host, "ec2-user", "df -h"))
+print(run_command(host, "ec2-user", "uptime"))
+print(run_command(host, "ec2-user", "systemctl --failed"))
 ```
 
 ```bash
-/opt/aiops/venv/bin/python3 collect.py
+/opt/aiops/venv/bin/python3 /opt/aiops/collect.py
 ```
 
-Like this AI will collect the data from all EC2 instances by discovering it
+### Restart and check the AIOps service
+
+```bash
+sudo systemctl restart aiops
+sudo systemctl status aiops --no-pager
+sudo journalctl -u aiops -n 100 --no-pager
+```
 
 ### Add the ENV variables - slack webhook and Gemini key
 
@@ -1822,9 +1805,9 @@ Slack Incident Report
 
 ## Phase 4 — Auto-Remediation
 
-phase -3
+> **Use extra caution:** the example below can restart services, drop Linux filesystem caches, and delete old files under `/tmp`. Keep `AUTO_REMEDIATE=false` while testing and do not enable these actions on production systems without reviewing and approving each command.
 
-### Make it better by adding safe auto-remediation with
+### Configure the remediation workflow
 
 InstanceDown       → restart service
 HighCPUUsage       → find top process, optional restart service
@@ -2151,36 +2134,37 @@ if __name__ == "__main__":
     )
 ```
 
+Only for an isolated test environment, edit `/opt/aiops/.env` and change its existing `AUTO_REMEDIATE` line to `true`. Do not add a second, conflicting value to the systemd unit. Keep `AUTO_REMEDIATE=false` for normal operation.
+
 ```bash
-sudo vi /etc/systemd/system/aiops.service
+sudo vi /opt/aiops/.env
 ```
 
-[Add two more extra line with Environment]
+```dotenv
+AUTO_REMEDIATE=true
+```
 
-Environment="AUTO_REMEDIATE=true"
-EnvironmentFile=/opt/aiops/.env
+Restart and verify the service:
 
 ```bash
 sudo systemctl daemon-reload
-```
-
-```bash
 sudo systemctl restart aiops
+sudo systemctl status aiops --no-pager
 ```
 
 ```bash
 sudo journalctl -u aiops -f
 ```
 
-### On Test-1 run the command
+### Trigger a test incident
 
 ```bash
 stress --cpu 4 --timeout 300
 ```
 
-Wait for few mins, and you get slack message
+Wait for the alert to fire and confirm the incident report arrives in Slack. Stop the stress process if it is still running.
 
-### Sample SLACK message
+### Example Slack report
 
 AIOps Incident Analysis
 
@@ -2259,7 +2243,7 @@ Feel free to reach out if you have any questions or need further details.
 
 ## Phase 5 — Nginx Example, RAG Runbook (ChromaDB)
 
-Example
+### Incident flow
 
 Nginx stopped on EC2
         ↓
@@ -2384,9 +2368,7 @@ sudo systemctl status nginx-exporter
 curl http://localhost:9113/metrics | grep nginx_up
 ```
 
-### Add nginx exporter to Prometheus
-
-### On Prometheus server [MonitoringServer]
+### Configure the Nginx scrape target on the monitoring server
 
 ```bash
 sudo vi /etc/prometheus/prometheus.yml
@@ -2396,7 +2378,7 @@ sudo vi /etc/prometheus/prometheus.yml
   - job_name: "nginx"
     static_configs:
       - targets:
-          - "172.31.29.187:9113"
+          - "TEST_1_PRIVATE_IP:9113"
         labels:
           service: "nginx"
 ```
@@ -2409,9 +2391,9 @@ promtool check config /etc/prometheus/prometheus.yml
 sudo systemctl restart prometheus
 ```
 
-http://<prometheus-ip>:9090/targets
+Open `http://MONITORING_PUBLIC_IP:9090/targets` and confirm the Nginx exporter target is **UP**.
 
-### Add nginx alert rule
+### Add the Nginx alert rule
 
 ```bash
 sudo vi /etc/prometheus/alert.rules.yml
@@ -2588,17 +2570,17 @@ sudo vi /opt/aiops/servers.json
 ```json
 {
   "Test-1": {
-    "host": "172.31.20.42",
+    "host": "TEST_1_PRIVATE_IP",
     "user": "ec2-user"
   },
 
   "Test-2": {
-    "host": "172.31.19.78",
+    "host": "TEST_2_PRIVATE_IP",
     "user": "ec2-user"
   },
 
-  "172.31.20.42:9113": {
-    "host": "172.31.20.42",
+  "TEST_1_PRIVATE_IP:9113": {
+    "host": "TEST_1_PRIVATE_IP",
     "user": "ec2-user",
     "services": {
       "nginx": "nginx"
@@ -2607,15 +2589,15 @@ sudo vi /opt/aiops/servers.json
 }
 ```
 
-### Check Syntax
+### Validate the inventory JSON
 
-Note: Be carefull, after every block , is required
+Note: Make sure each JSON object property is separated by a comma.
 
 ```bash
 python3 -m json.tool /opt/aiops/servers.json
 ```
 
-### Add nginx remediation function in app.py
+### Add Nginx remediation to `app.py`
 
 ```bash
 vi app.py
@@ -3083,7 +3065,7 @@ sudo systemctl status aiops
 sudo journalctl -u aiops -f
 ```
 
-### Chnage the test values to real, change cpu > 80, Disk>80 so that it will fire only nginx now
+### Set demo alert thresholds for the Nginx test
 
 Be in the Monitoring Server
 
@@ -3105,7 +3087,7 @@ Now refresh Prometheus URL and it shows all GREEN
 
 ## Troubleshooting & Errors
 
-### troubleshooting
+### Check service logs and active alerts
 
 ```bash
 sudo journalctl -u aiops -f
@@ -3165,7 +3147,7 @@ curl -X POST http://localhost:5000/alert \
     "labels": {
       "alertname": "NginxDown",
       "severity": "critical",
-      "instance": "172.31.21.222:9113",
+      "instance": "TEST_1_PRIVATE_IP:9113",
       "service": "nginx"
     }
   }]
@@ -3264,7 +3246,7 @@ scrape_configs:
   - job_name: "nginx"
     static_configs:
       - targets:
-          - "172.31.20.42:9113"
+          - "TEST_1_PRIVATE_IP:9113"
         labels:
           service: "nginx"
 ```
@@ -3311,7 +3293,7 @@ Now check in Prometheus URL --> Alerts
 
 Check in Alert manager also, nginxdown alert
 
-http://3.108.218.31:9093/#/alerts
+http://MONITORING_PUBLIC_IP:9093/#/alerts
 
 ```bash
 sudo journalctl -u aiops -f
@@ -3321,7 +3303,7 @@ Now see, the Nginx status in Test1 Server and see the SLACK ALERT
 
 After project, Delete the Gemini API key and terminate EC2 Instances
 
-### ERRORS
+### Alertmanager permission errors
 
 ```bash
 sudo journalctl -u alertmanager -f
